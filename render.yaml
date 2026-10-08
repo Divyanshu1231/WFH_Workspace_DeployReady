@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: wfh-workspace
+    runtime: node
+    buildCommand: npm --prefix server install && npm --prefix client install --include=dev && npm --prefix client run build
+    startCommand: npm --prefix server start
+    healthCheckPath: /api/health
+    plan: free
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: VITE_FACE_API_URL
+        value: https://wfh-face-attendance.onrender.com
+      - key: FACE_API_URL   # runtime override: set to the REAL URL of the Python face service (no rebuild needed)
+        sync: false
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_USER
+        sync: false
+      - key: TURN_PASS
+        sync: false
+      - key: CF_TURN_KEY_ID
+        sync: false
+      - key: CF_TURN_API_TOKEN
+        sync: false
+      - key: METERED_DOMAIN
+        sync: false
+      - key: METERED_API_KEY
+        sync: false
+
+  - type: web
+    name: wfh-face-attendance
+    runtime: python
+    rootDir: face-attendance
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
