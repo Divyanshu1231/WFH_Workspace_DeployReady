@@ -1,11 +1,14 @@
 {
-  "name": "wfh-workspace-face-attendance",
-  "private": true,
+  "name": "wfh-server",
+  "type": "module",
   "scripts": {
-    "install-all": "npm --prefix server install && npm --prefix client install",
-    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
-    "build": "npm --prefix client install --include=dev && npm --prefix client run build",
-    "start": "npm --prefix server start"
+    "dev": "node --watch server.js",
+    "start": "node server.js"
   },
-  "devDependencies": { "concurrently": "^9.1.0" }
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
+  }
 }
