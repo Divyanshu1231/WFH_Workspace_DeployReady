@@ -6,6 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
+import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 4000;
@@ -15,6 +16,10 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 const ATT_FILE = process.env.ATTENDANCE_FILE || path.join(__dirname, 'attendance.json');
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN ?? 330); // India (IST) by default
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
+// With DATABASE_URL (Neon/Postgres) attendance survives restarts & redeploys. Without it, falls back to a local JSON file (lost on Render free).
+const pool = DATABASE_URL ? new pg.Pool({ connectionString: DATABASE_URL, max: 4, idleTimeoutMillis: 30000, connectionTimeoutMillis: 15000 }) : null;
+if (pool) pool.on('error', e => console.error('pg pool error:', e.message));
 
 const app = express();
 app.use(cors({ origin: ORIGIN === '*' ? true : ORIGIN }));
@@ -107,8 +112,68 @@ app.get('/api/config', (_, res) => {
 
 // ---------- Simple attendance (name based) ----------
 let attendance = [];
-try { attendance = JSON.parse(fs.readFileSync(ATT_FILE, 'utf8')); } catch { /* first run */ }
-const saveAttendance = () => { try { fs.writeFileSync(ATT_FILE, JSON.stringify(attendance)); } catch (e) { console.error('attendance save failed:', e.message); } };
+const savedSig = new Map();
+const sig = r => `${r.employee_id}|${r.name}|${r.department}|${r.marked_at}|${Math.round(r.work_ms || 0)}|${Math.round(r.break_ms || 0)}|${r.last_status}|${r.updated_at}`;
+const nextId = () => attendance.reduce((m, r) => Math.max(m, Number(r.id) || 0), 0) + 1;
+let saving = Promise.resolve();
+
+async function loadAttendance() {
+  if (!pool) { try { attendance = JSON.parse(fs.readFileSync(ATT_FILE, 'utf8')); } catch { /* first run */ } return; }
+  let lastErr;
+  for (let i = 1; i <= 5; i++) {
+    try {
+      await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
+        id BIGINT PRIMARY KEY, employee_id TEXT NOT NULL, name TEXT NOT NULL, department TEXT DEFAULT '',
+        marked_at TEXT NOT NULL, work_ms BIGINT DEFAULT 0, break_ms BIGINT DEFAULT 0,
+        last_status TEXT DEFAULT 'present', updated_at TEXT)`);
+      await pool.query('CREATE INDEX IF NOT EXISTS attendance_marked_idx ON attendance (marked_at)');
+      const { rows } = await pool.query('SELECT * FROM attendance ORDER BY id');
+      attendance = rows.map(r => ({ ...r, id: Number(r.id), work_ms: Number(r.work_ms), break_ms: Number(r.break_ms) }));
+      for (const r of attendance) savedSig.set(r.id, sig(r));
+      if (!attendance.length) { // one-time import of an old JSON file, if present
+        try { attendance = JSON.parse(fs.readFileSync(ATT_FILE, 'utf8')); console.log(`Imported ${attendance.length} rows from ${ATT_FILE}`); } catch { /* nothing to import */ }
+      }
+      console.log(`Attendance DB ready (${attendance.length} rows)`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.error(`DB connect attempt ${i}/5 failed:`, e.message);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+  throw lastErr; // never run with an empty in-memory list over a real DB: exit and let Render restart
+}
+
+async function flushToDb() {
+  const items = attendance.filter(r => savedSig.get(r.id) !== sig(r)).map(r => ({ r, s: sig(r) }));
+  if (!items.length) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const { r } of items) {
+      await client.query(
+        `INSERT INTO attendance (id, employee_id, name, department, marked_at, work_ms, break_ms, last_status, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (id) DO UPDATE SET employee_id=EXCLUDED.employee_id, name=EXCLUDED.name, department=EXCLUDED.department,
+           marked_at=EXCLUDED.marked_at, work_ms=EXCLUDED.work_ms, break_ms=EXCLUDED.break_ms,
+           last_status=EXCLUDED.last_status, updated_at=EXCLUDED.updated_at`,
+        [r.id, r.employee_id, r.name, r.department || '', r.marked_at, Math.round(r.work_ms || 0), Math.round(r.break_ms || 0), r.last_status || 'present', r.updated_at || null]);
+    }
+    await client.query('COMMIT');
+    for (const { r, s: sg } of items) savedSig.set(r.id, sg);
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+const saveAttendance = () => {
+  if (!pool) { try { fs.writeFileSync(ATT_FILE, JSON.stringify(attendance)); } catch (e) { console.error('attendance save failed:', e.message); } return Promise.resolve(); }
+  saving = saving.then(flushToDb).catch(e => console.error('attendance save failed (will retry):', e.message));
+  return saving;
+};
 const todayKey = () => localIso().slice(0, 10);
 const findTodayAttendance = u => {
   const today = todayKey();
@@ -155,7 +220,7 @@ const adminAuth = (req, res, next) => {
   next();
 };
 
-app.post('/api/attendance', (req, res) => {
+app.post('/api/attendance', async (req, res) => {
   const name = String(req.body?.name || '').trim().slice(0, 40);
   const empId = String(req.body?.employeeId || '').trim().slice(0, 30) || name.toLowerCase().replace(/\s+/g, '-');
   if (!name) return res.status(400).json({ detail: 'Naam likhna zaroori hai' });
@@ -163,9 +228,9 @@ app.post('/api/attendance', (req, res) => {
   const today = now.slice(0, 10);
   const existing = attendance.find(r => r.employee_id === empId && r.marked_at.slice(0, 10) === today);
   if (existing) return res.json({ employee: { id: empId, name }, marked_at: existing.marked_at, duplicate: true });
-  const row = { id: attendance.length + 1, employee_id: empId, name, department: '', marked_at: now, work_ms: 0, break_ms: 0, last_status: 'present' };
+  const row = { id: nextId(), employee_id: empId, name, department: '', marked_at: now, work_ms: 0, break_ms: 0, last_status: 'present' };
   attendance.push(row);
-  saveAttendance();
+  await saveAttendance();
   res.json({ employee: { id: empId, name }, marked_at: now, duplicate: false });
 });
 
@@ -395,6 +460,16 @@ setInterval(() => {
   for (const u of users.values()) if (u.role === 'employee' && u.sharing) { updateAttendanceSession(u, false); any = true; }
   if (any) saveAttendance();
 }, 10000);
+
+await loadAttendance();
+
+const shutdown = async signal => {
+  console.log(`${signal} received - saving attendance before exit`);
+  try { for (const u of users.values()) flushSession(u); await saveAttendance(); } catch (e) { console.error(e.message); }
+  process.exit(0);
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`WFH server running on http://localhost:${PORT}`);
